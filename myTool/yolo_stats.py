@@ -168,19 +168,36 @@ def parse_yolo_label_file(path: str) -> Tuple[int, Dict[int, int], Set[int], int
     return valid, class_counts, classes_in_file, invalid_lines
 
 
-def parse_voc_xml_label_file(path: str) -> Tuple[int, Dict[int, int], Set[int], int]:
-    """解析 VOC XML；以 <object> 數量作為有效實例數。若解析失敗，計 1 無效行。"""
+def parse_voc_xml_label_file(path: str) -> Tuple[int, Dict[str, int], Set[str], int]:
+    """
+    解析 VOC XML：
+    - 以 <object> 數量作為有效實例數
+    - 以 <object><name> 做為類別，統計每類別的實例數與本檔出現之類別集合
+    """
     try:
         tree = ET.parse(path)
         root = tree.getroot()
-        # VOC 結構通常為 <annotation><object>...</object></annotation>
-        objects = root.findall('.//object')
-        valid = len(objects)
-        # 這裡不蒐集類別名稱到 per_class（維持 YOLO 整數 ID 統計的既有行為）
-        return valid, defaultdict(int), set(), 0
+        objects = root.findall(".//object")
+
+        valid = 0
+        class_counts: Dict[str, int] = defaultdict(int)
+        classes_in_file: Set[str] = set()
+
+        for obj in objects:
+            name_el = obj.find("name")
+            if name_el is not None:
+                name_text = (name_el.text or "").strip()
+                if name_text:
+                    class_counts[name_text] += 1
+                    classes_in_file.add(name_text)
+                    valid += 1
+
+        # 這裡不特別記「無效行數」，解析成功就當作 0
+        return valid, class_counts, classes_in_file, 0
     except Exception:
         # 解析失敗視為 1 無效行，避免中斷
         return 0, defaultdict(int), set(), 1
+
 
 
 def parse_label_file(path: str) -> Tuple[int, Dict[int, int], Set[int], int]:
@@ -436,13 +453,29 @@ def print_stats(stats: YOLOStats, class_names: Optional[List[str]] = None):
     # 類別表
     if stats.per_class_instances:
         print("=== 各類別統計 ===")
-        print("class_id\tclass_name\tinstances\timages_with_class")
-        for cid in sorted(stats.per_class_instances.keys()):
+        print("class_id/name\tclass_name\tinstances\timages_with_class")
+
+        # key 可能是 int（YOLO）也可能是 str（VOC），用 str() 來排序避免型別衝突
+        for cid in sorted(stats.per_class_instances.keys(), key=lambda x: str(x)):
             cname = ""
-            if class_names and 0 <= cid < len(class_names):
-                cname = class_names[cid]
+
+            # 若是 YOLO 整數 ID，且有提供 class_names，則用 index 查名字
+            idx: Optional[int] = None
+            if isinstance(cid, int):
+                idx = cid
+            else:
+                # 若 key 是 "0", "1" 這種字串，也嘗試轉成 int 以利用 class_names
+                try:
+                    idx = int(str(cid))
+                except ValueError:
+                    idx = None
+
+            if class_names and idx is not None and 0 <= idx < len(class_names):
+                cname = class_names[idx]
+
             print(
-                f"{cid}\t\t{cname}\t\t{stats.per_class_instances[cid]}\t\t{stats.per_class_image_count.get(cid, 0)}"
+                f"{cid}\t\t{cname}\t\t{stats.per_class_instances[cid]}"
+                f"\t\t{stats.per_class_image_count.get(cid, 0)}"
             )
     else:
         print("（沒有可用的類別實例統計）")
