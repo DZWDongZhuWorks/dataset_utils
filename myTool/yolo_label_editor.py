@@ -1,43 +1,53 @@
 import os
 import argparse
 
-def process_annotation_lines(lines, src_class: str, dst_class: str = None):
+def process_annotation_lines(lines, src_classes: list[str], dst_class: str = None):
     """
     處理一個檔案的所有行，回傳新的行列表：
-    - 如果只給 src_class，則刪除所有以 src_class 開頭的行
-    - 如果還給了 dst_class，則把所有以 src_class 開頭的行，替換成以 dst_class 開頭
+    - 如果未提供 dst_class：刪除所有以 src_classes 中任一項開頭的行
+    - 如果提供 dst_class：把所有目標行的類別改成 dst_class
     """
     new_lines = []
+    src_set = set(src_classes)
+
     for line in lines:
         parts = line.strip().split()
-        if parts and parts[0] == src_class:
+        if not parts:
+            continue
+
+        cls = parts[0]
+
+        if cls in src_set:
             if dst_class is None:
-                # 刪除這一行
+                # 刪除
                 continue
             else:
-                # 將 class id 改成 dst_class
+                # 改類別
                 parts[0] = dst_class
                 line = ' '.join(parts) + '\n'
+
         new_lines.append(line)
+
     return new_lines
 
-def batch_process_folder(folder_path: str, src_class: str, dst_class: str = None,
+
+def batch_process_folder(folder_path: str, src_classes: list[str], dst_class: str = None,
                          ext: str = '.txt', output_folder: str = None) -> None:
-    """
-    遞迴掃描資料夾，處理所有指定副檔名的檔案，
-    如果提供 output_folder，則把結果寫到對應的相對路徑下；否則覆蓋原檔。
-    """
+
     for root, _, files in os.walk(folder_path):
         for fname in files:
             if not fname.lower().endswith(ext):
                 continue
+
             in_path = os.path.join(root, fname)
-            # 讀入原始檔案
+
+            # 讀檔
             with open(in_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-            new_lines = process_annotation_lines(lines, src_class, dst_class)
 
-            # 決定輸出路徑
+            new_lines = process_annotation_lines(lines, src_classes, dst_class)
+
+            # 決定輸出位置
             if output_folder:
                 rel_dir = os.path.relpath(root, folder_path)
                 out_dir = os.path.join(output_folder, rel_dir)
@@ -46,11 +56,11 @@ def batch_process_folder(folder_path: str, src_class: str, dst_class: str = None
             else:
                 out_path = in_path
 
-            # 寫出結果
+            # 寫出
             with open(out_path, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)
 
-            action = f"{src_class} 改成 {dst_class}" if dst_class else f"已刪除 {src_class}"
+            action = f"{src_classes} → {dst_class}" if dst_class else f"刪除 {src_classes}"
             print(f"[{action}] {out_path}")
 
 def main():
@@ -58,8 +68,8 @@ def main():
         description="刪除或轉換 YOLO 標註檔中的類別編號，並可選擇輸出到新資料夾")
     parser.add_argument('-f', '--folder', required=True,
                         help="要處理的資料夾路徑")
-    parser.add_argument('-c', '--class', dest='src_class', required=True,
-                        help="原本的類別編號 (例如 '8')")
+    parser.add_argument('-c', '--class', dest='src_classes', nargs='+', required=True,
+                        help="原本的類別編號，可一次指定多個，例如: -c 3 5 7")
     parser.add_argument('-t', '--to-class', dest='dst_class',
                         help="要轉換成的類別編號 (例如 '5')，不指定則刪除 src_class")
     parser.add_argument('-e', '--ext', default='.txt',
