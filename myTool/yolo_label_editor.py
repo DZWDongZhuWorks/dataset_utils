@@ -88,7 +88,7 @@ def main():
 
     batch_process_folder(
         folder_path=args.folder,
-        src_class=args.src_class,
+        src_classes=args.src_classes,
         dst_class=args.dst_class,
         ext=args.ext,
         output_folder=args.output_folder
