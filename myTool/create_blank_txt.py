@@ -11,15 +11,18 @@ def create_blank_txt(txt_path):
 
 def process_folder(folder_path):
     """
-    遍歷指定資料夾內所有 jpg 檔案，若對應的 txt 檔案不存在，則建立一個空白的 txt 檔案。
+    遍歷指定資料夾及其所有子資料夾內的 jpg 檔案，
+    若對應的 txt 檔案不存在，則建立一個空白的 txt 檔案。
     """
-    for file in os.listdir(folder_path):
-        if file.lower().endswith(".jpg"):
-            file_base = os.path.splitext(file)[0]
-            txt_filename = file_base + ".txt"
-            txt_path = os.path.join(folder_path, txt_filename)
-            if not os.path.exists(txt_path):
-                create_blank_txt(txt_path)
+    # os.walk 會幫你遞迴走遍所有子目錄
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith(".jpg"):
+                file_base = os.path.splitext(file)[0]
+                txt_filename = file_base + ".txt"
+                txt_path = os.path.join(root, txt_filename)  # 注意用 root，而不是最外層 folder_path
+                if not os.path.exists(txt_path):
+                    create_blank_txt(txt_path)
 
 if __name__ == "__main__":
     folder = input("請輸入資料夾路徑：")
