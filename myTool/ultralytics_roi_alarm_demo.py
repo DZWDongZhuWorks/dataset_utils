@@ -16,6 +16,53 @@ from ultralytics import YOLO
 # ==========================================
 # 1. Data Models (共用資料結構)
 # ==========================================
+def summarize_roi_frame(roi_states, roi_hits, rule_lookup):
+    """
+    回傳一個 dict，方便後續做統計/記錄
+    {
+      roi_id: {
+        "roi_triggered": bool,
+        "rules": {
+          rule_id: {"count": int, "threshold": int, "triggered": bool, "class_name": str}
+        }
+      }
+    }
+    """
+    out = {}
+    for rid, st in roi_states.items():
+        rules_info = {}
+        for rule_id, count in roi_hits.get(rid, {}).items():
+            rule = rule_lookup[rule_id]
+            rules_info[rule_id] = {
+                "class_name": rule.class_name,
+                "count": count,
+                "threshold": rule.trigger,
+                "triggered": (count >= rule.trigger),
+            }
+        out[rid] = {"roi_triggered": st.triggered, "rules": rules_info}
+    return out
+
+def get_summary_trigger_count(summary: Dict[int, Any]) -> int:
+    """
+    快速回傳 summarize 中 ROI 觸發的數量
+    """
+    return sum(1 for v in summary.values() if v.get("roi_triggered", False))
+
+@dataclass
+class RuleTrackState:
+    streak: int = 0       # 連續(或容錯後)命中累積
+    miss: int = 0         # streak 期間的連續 miss 計數
+    fired: bool = False   # 是否已對本次 streak 觸發過事件（避免每幀都觸發）
+
+@dataclass
+class TriggerEvent:
+    frame_idx: int
+    roi_id: int
+    rule_id: str
+    class_name: str
+    count: int
+    threshold: int
+    streak: int
 
 @dataclass(frozen=True)
 class Point:
@@ -52,6 +99,74 @@ class ROIState:
     roi_id: int
     triggered: bool
     trigger_details: List[str] # e.g. ["person:rule_1(3/2)"]
+
+class TriggerTracker:
+    def __init__(self, warn_frames: int = 0, max_miss: int = 0):
+        self.warn_frames = int(warn_frames)
+        self.max_miss = int(max_miss)
+        self._state: Dict[Tuple[int, str], RuleTrackState] = {}
+
+    def update(self, frame_idx: int, roi_hits: Dict[int, Dict[str, int]], rule_lookup: Dict[str, Any]) -> List[TriggerEvent]:
+        events: List[TriggerEvent] = []
+
+        # 本 frame 哪些 (roi, rule) 是 triggered
+        triggered_now: Dict[Tuple[int, str], Tuple[int, int, str]] = {}
+        # value: (count, threshold, class_name)
+
+        for rid, rule_counts in roi_hits.items():
+            for rule_id, count in rule_counts.items():
+                rule = rule_lookup[rule_id]
+                threshold = int(rule.trigger)
+                if threshold <= 0:
+                    continue
+                if count >= threshold:
+                    triggered_now[(rid, rule_id)] = (int(count), threshold, rule.class_name)
+
+        # 對所有出現過的 key 做狀態更新（包含本 frame 沒命中的也要處理 miss）
+        all_keys = set(self._state.keys()) | set(triggered_now.keys())
+
+        for key in all_keys:
+            st = self._state.setdefault(key, RuleTrackState())
+            rid, rule_id = key
+
+            if key in triggered_now:
+                count, threshold, class_name = triggered_now[key]
+                st.streak += 1
+                st.miss = 0
+
+                # 判斷是否該 emit
+                if self.warn_frames <= 0:
+                    # 預設行為：本 frame 觸發就算（但仍可用 fired 控制只噴一次）
+                    if not st.fired:
+                        events.append(TriggerEvent(frame_idx, rid, rule_id, class_name, count, threshold, st.streak))
+                        st.fired = True
+                else:
+                    if st.streak >= self.warn_frames and not st.fired:
+                        events.append(TriggerEvent(frame_idx, rid, rule_id, class_name, count, threshold, st.streak))
+                        st.fired = True
+
+            else:
+                # 沒命中：只有在 streak>0 才計 miss
+                if st.streak > 0:
+                    st.miss += 1
+                    if st.miss > self.max_miss:
+                        # streak 斷掉，重置
+                        st.streak = 0
+                        st.miss = 0
+                        st.fired = False
+
+        return events
+
+    def is_rule_active(self, roi_id: int, rule_id: str) -> bool:
+        """檢查特定規則是否滿足 warn-frame 條件（Active）"""
+        key = (roi_id, rule_id)
+        if key not in self._state:
+            return False
+        st = self._state[key]
+        if self.warn_frames <= 0:
+            return st.streak > 0
+        else:
+            return st.streak >= self.warn_frames
 
 
 # ==========================================
@@ -344,12 +459,15 @@ class ResultRenderer:
 # ==========================================
 
 class VideoPipeline:
-    def __init__(self, detector: ObjectDetector, roi_engine: ROIEngine, renderer: ResultRenderer):
+    def __init__(self, detector: ObjectDetector, roi_engine: ROIEngine, renderer: ResultRenderer, tracker=None):
         self.detector = detector
         self.roi_engine = roi_engine
         self.renderer = renderer
+        self.tracker = tracker
 
     def run(self, source: str, output_path: Optional[str] = None, show: bool = False):
+        rule_lookup = {r.rule_id: r for r in self.roi_engine.rules}  # 你 renderer 也在用
+        frame_idx = 0
         cap = cv2.VideoCapture(source)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open source: {source}")
@@ -379,11 +497,28 @@ class VideoPipeline:
                 # Step 2: ROI Logic (只依賴清洗過的 detections)
                 roi_states, roi_hits  = self.roi_engine.evaluate(detections)
 
-                print(f"[DEBUG] ROI States: {roi_states}")
+                # Step 2.5: Tracker Update (引入時間維度 / warn-frame 邏輯)
+                if self.tracker:
+                    self.tracker.update(frame_idx, roi_hits, rule_lookup)
+                    
+                    # 覆寫 roi_states 的 triggered 狀態，改由 Tracker 判定
+                    # 只有當 Tracker 認定該 ROI 有規則處於 Active 狀態時，才算觸發
+                    active_rois = set()
+                    # 遍歷 tracker 內部狀態找出 active 的 rule/roi
+                    for (rid, rule_id) in self.tracker._state:
+                        if self.tracker.is_rule_active(rid, rule_id):
+                            active_rois.add(rid)
+                    
+                    for rid, st in roi_states.items():
+                        st.triggered = (rid in active_rois)
+
+                summary = summarize_roi_frame(roi_states, roi_hits, rule_lookup)
 
                 # Step 3: Render (傳入 raw_result 給 plot() 使用)
                 # 注意：這裡回傳的是全新的 annotated_frame，不是原本的 frame
                 final_frame = frame # 預設若沒畫圖就是原圖
+                frame_idx += 1
+                print(f"[DEBUG] [{frame_idx}] Summary: {get_summary_trigger_count(summary)}", end='\r')
                 
                 if writer or show:
                     final_frame = self.renderer.draw(
@@ -427,7 +562,9 @@ def main():
     parser.add_argument("--classes", type=Path, required=True)
     parser.add_argument("--out", type=str, default="output.mp4")
     parser.add_argument("--show", action="store_true")
-    
+    parser.add_argument("--warn-frames", type=int, default=0, help="連續觸發門檻(幀). 0=當幀觸發即算")
+    parser.add_argument("--max-miss", type=int, default=0, help="連續觸發期間允許 miss 幀數")
+
     args = parser.parse_args()
 
     # 1. 實例化各模組 (Dependency Injection)
@@ -436,9 +573,13 @@ def main():
     roi_engine = ROIEngine(roi_json_path=args.roi, rules_path=args.classes)
     
     renderer = ResultRenderer()
-
+    tracker = TriggerTracker(warn_frames=args.warn_frames, max_miss=args.max_miss)
+    
     # 2. 建立 Pipeline 並執行
-    pipeline = VideoPipeline(detector, roi_engine, renderer)
+    pipeline = VideoPipeline(detector, roi_engine, renderer, tracker=tracker)
+
+
+
     
     pipeline.run(source=args.video, output_path=args.out, show=args.show)
 
