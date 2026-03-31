@@ -16,6 +16,22 @@ from ultralytics import YOLO
 # ==========================================
 # 1. Data Models (共用資料結構)
 # ==========================================
+
+VALID_OPS = {"<", "<=", "==", ">", ">="}
+
+def compare_count(count: int, op: str, threshold: int) -> bool:
+    if op == ">=":
+        return count >= threshold
+    if op == ">":
+        return count > threshold
+    if op == "==":
+        return count == threshold
+    if op == "<=":
+        return count <= threshold
+    if op == "<":
+        return count < threshold
+    raise ValueError(f"Unsupported op: {op}")
+
 def summarize_roi_frame(roi_states, roi_hits, rule_lookup):
     """
     回傳一個 dict，方便後續做統計/記錄
@@ -37,7 +53,8 @@ def summarize_roi_frame(roi_states, roi_hits, rule_lookup):
                 "class_name": rule.class_name,
                 "count": count,
                 "threshold": rule.trigger,
-                "triggered": (count >= rule.trigger),
+                "triggered": compare_count(count, rule.op, rule.trigger),
+                "op": rule.op,
             }
         out[rid] = {"roi_triggered": st.triggered, "rules": rules_info}
     return out
@@ -63,6 +80,7 @@ class TriggerEvent:
     count: int
     threshold: int
     streak: int
+    op: str = ">="
 
 @dataclass(frozen=True)
 class Point:
@@ -88,6 +106,7 @@ class PolygonROI:
 class ClassRule:
     class_key: str
     class_name: str
+    op: str     
     trigger: int
     roi_all: bool
     roi_set: Optional[Set[int]]
@@ -117,10 +136,11 @@ class TriggerTracker:
             for rule_id, count in rule_counts.items():
                 rule = rule_lookup[rule_id]
                 threshold = int(rule.trigger)
-                if threshold <= 0:
-                    continue
-                if count >= threshold:
+                op = rule.op
+
+                if compare_count(int(count), op, threshold):
                     triggered_now[(rid, rule_id)] = (int(count), threshold, rule.class_name)
+
 
         # 對所有出現過的 key 做狀態更新（包含本 frame 沒命中的也要處理 miss）
         all_keys = set(self._state.keys()) | set(triggered_now.keys())
@@ -238,11 +258,36 @@ class ROIEngine:
         # 建立索引
         self.rois_active: Dict[int, PolygonROI] = {r.id: r for r in self.rois_raw}
         self.rules_map: Dict[str, List[ClassRule]] = {} # key: class_name_lower
-        
+        self.rule_lookup: Dict[str, ClassRule] = {r.rule_id: r for r in self.rules}
+
         for r in self.rules:
-            if r.trigger > 0: # 只索引有效的規則
-                k = r.class_key # 已處理過大小寫
-                self.rules_map.setdefault(k, []).append(r)
+            k = r.class_key
+            self.rules_map.setdefault(k, []).append(r)
+
+        # ==========================================
+        # ZERO-sensitive rules index (for <, <=, ==)
+        # 目的：支援「count=0 也可能成立」的規則，例如 <1、==0、<=0
+        # 只為這些規則補零，避免 roi_hits 膨脹
+        # ==========================================
+        self._zero_sensitive_ops = {"<", "<=", "=="}
+        self._zero_rule_ids_by_roi: Dict[int, List[str]] = {rid: [] for rid in self.rois_active.keys()}
+
+        for rule in self.rules:
+            if rule.op not in self._zero_sensitive_ops:
+                continue
+
+            if rule.roi_all:
+                for rid in self._zero_rule_ids_by_roi.keys():
+                    self._zero_rule_ids_by_roi[rid].append(rule.rule_id)
+            else:
+                for rid in (rule.roi_set or []):
+                    if rid in self._zero_rule_ids_by_roi:
+                        self._zero_rule_ids_by_roi[rid].append(rule.rule_id)
+
+        # 去重 + 固定排序（讓輸出 deterministic）
+        for rid in self._zero_rule_ids_by_roi:
+            self._zero_rule_ids_by_roi[rid] = sorted(set(self._zero_rule_ids_by_roi[rid]))
+
         
         self.initialized_size = False
 
@@ -293,10 +338,17 @@ class ROIEngine:
                     for rule in relevant_rules:
                         if rule.roi_all or (rule.roi_set and rid in rule.roi_set):
                             roi_hits[rid][rule.rule_id] = roi_hits[rid].get(rule.rule_id, 0) + 1
+                            
+        # 1.5) 補齊 zero-sensitive 規則的 count=0
+        # 讓 <1 / ==0 / <=0 在「完全沒有目標」時也能被比較、進入 tracker
+        for rid, rule_ids in self._zero_rule_ids_by_roi.items():
+            m = roi_hits[rid]
+            for rule_id in rule_ids:
+                m.setdefault(rule_id, 0)
 
         # 2. 規則判定：檢查數量是否超過門檻
         states = {}
-        rule_lookup = {r.rule_id: r for r in self.rules}
+        rule_lookup = self.rule_lookup
 
         for rid in self.rois_active:
             triggered = False
@@ -304,9 +356,10 @@ class ROIEngine:
             
             for rule_id, count in roi_hits[rid].items():
                 rule = rule_lookup[rule_id]
-                if count >= rule.trigger:
+                if compare_count(count, rule.op, rule.trigger):
                     triggered = True
-                    details.append(f"{rule.class_name}({count}/{rule.trigger})")
+                    details.append(f"{rule.class_name}({count} {rule.op} {rule.trigger})")
+
             
             states[rid] = ROIState(roi_id=rid, triggered=triggered, trigger_details=details)
         
@@ -329,26 +382,56 @@ class ROIEngine:
         return out, data.get("image_size", {})
 
     def _load_rules(self, path: Path) -> List[ClassRule]:
-        # (這裡保留原有的解析邏輯，簡化展示)
-        rules = []
+        rules: List[ClassRule] = []
         lines = path.read_text("utf-8").splitlines()
-        counter_map = {}
+        counter_map: Dict[str, int] = {}
+
         for line in lines:
             line = line.strip()
-            if not line or line.startswith("#"): continue
+            if not line or line.startswith("#"):
+                continue
+
             parts = line.split()
-            c_name, trig_str, roi_str = parts[0], parts[1], parts[2]
-            
+            if len(parts) < 3:
+                raise ValueError(f"Invalid rule line (need >=3 tokens): {line}")
+
+            c_name = parts[0]
+
+            # NEW: 支援兩種格式：
+            # 1) class trigger roi               -> op default ">="
+            # 2) class op threshold roi
+            if parts[1] in VALID_OPS:
+                if len(parts) < 4:
+                    raise ValueError(f"Invalid rule line (op format need 4 tokens): {line}")
+                op = parts[1]
+                trig_str = parts[2]
+                roi_str = parts[3]
+            else:
+                op = ">="
+                trig_str = parts[1]
+                roi_str = parts[2]
+
+            threshold = int(trig_str)
+
             key = c_name if self.case_sensitive else c_name.lower()
             counter_map[key] = counter_map.get(key, 0) + 1
             rule_id = f"{c_name}_{counter_map[key]}"
-            
+
             roi_set = None
             roi_all = (roi_str == "-1")
             if not roi_all:
                 roi_set = set(int(x) for x in roi_str.split(",") if x)
 
-            rules.append(ClassRule(key, c_name, int(trig_str), roi_all, roi_set, rule_id))
+            rules.append(ClassRule(
+                class_key=key,
+                class_name=c_name,
+                op=op,
+                trigger=threshold,
+                roi_all=roi_all,
+                roi_set=roi_set,
+                rule_id=rule_id
+            ))
+
         return rules
 
 
@@ -357,6 +440,141 @@ class ROIEngine:
 # ==========================================
 
 class ResultRenderer:
+    # ---------------------------
+    # Debug overlay helpers
+    # ---------------------------
+    def _build_watermark_lines(self,
+                               frame_idx: int,
+                               roi_states: Dict[int, ROIState],
+                               roi_hits: Optional[Dict[int, Dict[str, int]]],
+                               rule_lookup: Optional[Dict[str, ClassRule]],
+                               tracker: Optional["TriggerTracker"],
+                               warn_frames: int) -> List[str]:
+        """
+        產生右上角 overlay 的文字行
+        格式示例：
+        Frame: 1234
+        ROI-1 [ACTIVE] streak_max=7 warn=5
+          person: cnt=2  op=>= thr=3  streak=4/5  active=0
+          car:    cnt=1  op=>= thr=1  streak=8/5  active=1
+        ROI-2 [----] ...
+        """
+        lines: List[str] = []
+        lines.append(f"Frame: {frame_idx}")
+
+        if roi_hits is None or rule_lookup is None:
+            lines.append("roi_hits/rule_lookup: (none)")
+            return lines
+
+        # 依 ROI 排序，方便比對
+        for rid in sorted(roi_states.keys()):
+            st = roi_states[rid]
+            hits = roi_hits.get(rid, {}) if roi_hits else {}
+
+            # 該 ROI 下所有 rule_id（用 hits 為主；若想顯示全部規則也可改）
+            rule_ids = sorted(hits.keys())
+
+            counting_rules = len(rule_ids)  # 本幀有計數到的規則（hits 出現）
+            pending_rules = 0
+            alarm_rules = 0
+            streak_max = 0
+
+            if tracker is not None:
+                for rule_id in rule_ids:
+                    ts = tracker._state.get((rid, rule_id))
+                    if ts is not None:
+                        streak_max = max(streak_max, ts.streak)
+                        if tracker.is_rule_active(rid, rule_id):
+                            alarm_rules += 1
+                        elif ts.streak > 0:
+                            pending_rules += 1
+
+            roi_tag = "ALARM" if alarm_rules > 0 else "----"
+            lines.append(
+                f"ROI-{rid} [{roi_tag}] C-rl={counting_rules} P-rl={pending_rules} alarms={alarm_rules} "
+                f"{streak_max}/{warn_frames}"
+            )
+
+            if not rule_ids:
+                lines.append("  (no hits)")
+                continue
+
+            for rule_id in rule_ids:
+                rule = rule_lookup.get(rule_id)
+                if rule is None:
+                    lines.append(f"  {rule_id}: (missing rule)")
+                    continue
+
+                cnt = int(hits.get(rule_id, 0))
+                op = getattr(rule, "op", ">=")   # 向下相容
+                thr = int(rule.trigger)
+
+                streak = "-"
+                active = 0
+                if tracker is not None:
+                    ts = tracker._state.get((rid, rule_id))
+                    if ts is not None:
+                        streak = f"{ts.streak}/{warn_frames if warn_frames > 0 else 1}"
+                    active = 1 if tracker.is_rule_active(rid, rule_id) else 0
+
+                # 顯示：class name : count / thres + streak/active
+                # 你也可加上 miss / fired 等欄位
+                lines.append(
+                    f"  {rule.class_name}: {cnt}{op}{thr} | {streak} | {active}"
+                )
+
+        return lines
+
+    def _draw_text_overlay_top_right(self,
+                                    frame: np.ndarray,
+                                    lines: List[str],
+                                    max_lines: int = 40,
+                                    font_scale: float = 0.5,
+                                    thickness: int = 1,
+                                    pad: int = 8,
+                                    line_gap: int = 4,
+                                    alpha: float = 0.45) -> None:
+        """
+        在右上角畫半透明底 + 多行文字
+        """
+        if frame is None or frame.size == 0:
+            return
+        if not lines:
+            return
+
+        lines = lines[:max_lines]
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        # 量測最大寬度與總高度
+        sizes = [cv2.getTextSize(s, font, font_scale, thickness)[0] for s in lines]
+        text_w = max((w for w, h in sizes), default=0)
+        text_h = sum((h for w, h in sizes), 0) + (len(lines) - 1) * line_gap
+
+        H, W = frame.shape[:2]
+        box_w = text_w + pad * 2
+        box_h = text_h + pad * 2
+
+        # 右上角定位
+        x2 = W - 10
+        y1 = 10
+        x1 = max(0, x2 - box_w)
+        y2 = min(H - 1, y1 + box_h)
+
+        # 半透明底
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+        # 文字
+        y = y1 + pad
+        for (s, (w, h)) in zip(lines, sizes):
+            y_text = y + h
+            cv2.putText(frame, s, (x1 + pad, y_text), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            y = y_text + line_gap
+
+    # ---------------------------
+    # Main draw
+    # ---------------------------
     def draw(self,
              raw_result: Any,
              detections: List[Detection],
@@ -367,16 +585,18 @@ class ResultRenderer:
              rule_lookup: Optional[Dict[str, ClassRule]] = None,
              case_sensitive: bool = False,
              draw_centers: bool = True,
-             color_center_by_roi: bool = True) -> np.ndarray:
+             color_center_by_roi: bool = True,
+             tracker: Optional["TriggerTracker"] = None,
+             frame_idx: int = 0,
+             watermark: bool = False,
+             wm_max_lines: int = 40,
+             warn_frames: int = 0) -> np.ndarray:
         """
-        使用 yolo 原生的 plot() 作為基礎，再疊加 ROI 資訊，並可選擇繪製偵測框中心點
-        - 開始 counting：黃色
-        - 觸發 trigger：紅色
-        - 其他：白色
+        ROI + centers + (optional) watermark overlay
         """
         annotated_frame = raw_result.plot()
 
-        # 1) 畫 ROI（原本邏輯不動）
+        # 1) 畫 ROI
         for rid, state in roi_states.items():
             roi = rois_map.get(rid)
             if not roi:
@@ -403,10 +623,9 @@ class ResultRenderer:
             cv2.putText(annotated_frame, label, (cx - 20, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # 2) 畫 Detection 中心點（改成：白 / 橘 / 紅）
+        # 2) 中心點（白/橘/紅，warn_frames 相容：有 tracker 時用 tracker）
         if draw_centers:
-            # ROI contour 預先準備（用排序確保命中 ROI 的選擇是 deterministic）
-            contours = {}
+            contours: Dict[int, np.ndarray] = {}
             for rid in sorted(rois_map.keys()):
                 roi = rois_map[rid]
                 contours[rid] = np.array(roi.original_points, dtype=np.int32).reshape((-1, 1, 2))
@@ -421,36 +640,57 @@ class ResultRenderer:
                             hit_roi_id = rid
                             break
 
-                # 預設：不在 ROI → 白色
-                color = (255, 255, 255)
+                color = (255, 255, 255)  # 白
 
                 if color_center_by_roi and hit_roi_id is not None:
-                    # 判斷是否「開始 counting」/「已 trigger」
                     key = det.class_name if case_sensitive else det.class_name.lower()
-
                     relevant_rules = (rules_map.get(key, []) if rules_map else [])
+
                     is_counting = False
                     is_triggered_center = False
 
-                    # 只有符合規則且該 ROI 會被該規則計數，才算「開始 counting」
                     for rule in relevant_rules:
-                        if rule.trigger <= 0:
-                            continue
                         if rule.roi_all or (rule.roi_set and hit_roi_id in rule.roi_set):
                             is_counting = True
-                            if roi_hits is not None:
-                                cnt = roi_hits.get(hit_roi_id, {}).get(rule.rule_id, 0)
-                                if cnt >= rule.trigger:
+
+                            if tracker is not None:
+                                if tracker.is_rule_active(hit_roi_id, rule.rule_id):
                                     is_triggered_center = True
                                     break
+                            else:
+                                if roi_hits is not None:
+                                    cnt = roi_hits.get(hit_roi_id, {}).get(rule.rule_id, 0)
+                                    if compare_count(cnt, rule.op, rule.trigger):
+                                        is_triggered_center = True
+                                        break
 
-                    # 上色：trigger 紅；counting 黃；其他白
                     if is_triggered_center:
-                        color = (0, 0, 255)        # 紅 (BGR)
+                        color = (0, 0, 255)        # 紅
                     elif is_counting:
-                        color = (0, 255, 255)      # 黃 (BGR)
+                        color = (0, 165, 255)      # 橘（若你想黃：改 (0,255,255)）
 
                 cv2.circle(annotated_frame, pt, 4, color, -1, lineType=cv2.LINE_AA)
+
+        # 3) 浮水印 overlay（右上角）
+        if watermark:
+            lines = self._build_watermark_lines(
+                frame_idx=frame_idx,
+                roi_states=roi_states,
+                roi_hits=roi_hits,
+                rule_lookup=rule_lookup,
+                tracker=tracker,
+                warn_frames=warn_frames,
+            )
+            self._draw_text_overlay_top_right(
+                annotated_frame,
+                lines=lines,
+                max_lines=wm_max_lines,
+                font_scale=0.5,
+                thickness=1,
+                pad=8,
+                line_gap=4,
+                alpha=0.45,
+            )
 
         return annotated_frame
 
@@ -459,11 +699,14 @@ class ResultRenderer:
 # ==========================================
 
 class VideoPipeline:
-    def __init__(self, detector: ObjectDetector, roi_engine: ROIEngine, renderer: ResultRenderer, tracker=None):
+    def __init__(self, detector, roi_engine, renderer, tracker=None, watermark=False, wm_max_lines=40):
         self.detector = detector
         self.roi_engine = roi_engine
         self.renderer = renderer
         self.tracker = tracker
+        self.watermark = watermark
+        self.wm_max_lines = wm_max_lines
+
 
     def run(self, source: str, output_path: Optional[str] = None, show: bool = False):
         rule_lookup = {r.rule_id: r for r in self.roi_engine.rules}  # 你 renderer 也在用
@@ -531,7 +774,12 @@ class VideoPipeline:
                         rule_lookup={r.rule_id: r for r in self.roi_engine.rules},
                         case_sensitive=self.roi_engine.case_sensitive,
                         draw_centers=True,
-                        color_center_by_roi=True
+                        color_center_by_roi=True,
+                        tracker=self.tracker,
+                        frame_idx=frame_idx,
+                        watermark=self.watermark,
+                        wm_max_lines=self.wm_max_lines,
+                        warn_frames=(self.tracker.warn_frames if self.tracker else 0)
                     )
 
 
@@ -564,6 +812,8 @@ def main():
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--warn-frames", type=int, default=0, help="連續觸發門檻(幀). 0=當幀觸發即算")
     parser.add_argument("--max-miss", type=int, default=0, help="連續觸發期間允許 miss 幀數")
+    parser.add_argument("--watermark", action="store_true", help="右上角顯示 debug overlay")
+    parser.add_argument("--wm-max-lines", type=int, default=40, help="overlay 最多顯示幾行")
 
     args = parser.parse_args()
 
@@ -576,9 +826,8 @@ def main():
     tracker = TriggerTracker(warn_frames=args.warn_frames, max_miss=args.max_miss)
     
     # 2. 建立 Pipeline 並執行
-    pipeline = VideoPipeline(detector, roi_engine, renderer, tracker=tracker)
-
-
+    pipeline = VideoPipeline(detector, roi_engine, renderer, tracker=tracker,
+                            watermark=args.watermark, wm_max_lines=args.wm_max_lines)
 
     
     pipeline.run(source=args.video, output_path=args.out, show=args.show)
